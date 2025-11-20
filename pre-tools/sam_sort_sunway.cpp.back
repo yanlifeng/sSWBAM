@@ -1,0 +1,544 @@
+// sam_sort_sunway.cpp
+//  Sunway 上按 chr(RNAME 第3列) + pos(第4列) 排序 SAM。
+//  - __sw_host__：主核代码，负责读文件、凑 64 个 buffer 调从核、写回排序结果、计时。
+//  - __sw_slave__：从核代码，负责对自己那块 SAM buffer 排序（in_buf -> out_buf）。
+//
+//  使用说明：
+//  1）编译主核版本：
+//      sw5cc -host -D__sw_host__ sam_sort_sunway.cpp -o sam_sort_host -lathread
+//  2）编译从核版本：
+//      sw5cc -slave -D__sw_slave__ sam_sort_sunway.cpp -o sam_sort_slave
+//  3）运行主核程序：
+//      ./sam_sort_host <input_dir> <output_dir>
+//      输入目录下是 *.sam，输出目录中将生成 *.sam.sorted.sw.sam
+//
+//  你可以根据自己工程的 Makefile/编译脚本微调。
+
+// ============================= 公共参数结构 =============================
+
+typedef struct {
+    char   *in_buf;   // 输入 SAM buffer
+    char   *out_buf;  // 输出 SAM buffer（排序后的结果）
+    unsigned long size;     // 输入有效字节数；CPE 处理完后写回输出长度
+    unsigned long *out_size;     // 输入有效字节数；CPE 处理完后写回输出长度
+} SamSortPara;
+
+// ============================= 从核代码 =============================
+#ifdef __sw_slave__
+
+extern "C" {
+#include <slave.h>
+}
+
+typedef struct {
+    unsigned long start;      // 在 in_buf 中的起始偏移
+    unsigned long len;        // 这一行长度（包含 '\n' 如果有）
+    const char   *rname;      // RNAME 指针（指向 in_buf 内部）
+    int           rname_len;  // RNAME 长度
+    long          pos;        // POS
+    int           valid;      // 是否成功解析出 RNAME+POS
+} LineInfo;
+
+extern "C" void* ldm_malloc(size_t size);
+extern "C" void ldm_free(void *addr, size_t size);
+
+// 解析一行（不含 '\n'）的 RNAME + POS
+static void parse_rname_pos(char *line_start, unsigned long text_len, LineInfo *info)
+{
+    info->rname     = 0;
+    info->rname_len = 0;
+    info->pos       = -1;
+    info->valid     = 0;
+
+    if (text_len == 0) return;
+
+    char *p   = line_start;
+    char *end = line_start + text_len;
+
+    // SAM: 0:QNAME, 1:FLAG, 2:RNAME, 3:POS, ...
+    int   field = 0;
+    char *field_start = p;
+
+    char *rname_start = 0;
+    char *rname_end   = 0;
+    char *pos_start   = 0;
+    char *pos_end     = 0;
+
+    while (p <= end) {
+        if (p == end || *p == '\t') {
+            if (field == 2) {          // RNAME
+                rname_start = field_start;
+                rname_end   = (char*)p;
+            } else if (field == 3) {   // POS
+                pos_start = field_start;
+                pos_end   = (char*)p;
+                break;                 // POS 后面不关心
+            }
+            field++;
+            field_start = p + 1;
+        }
+        if (p == end) break;
+        ++p;
+    }
+
+    if (!rname_start || !pos_start) {
+        info->valid = 0;
+        return;
+    }
+
+    info->rname     = rname_start;
+    info->rname_len = (int)(rname_end - rname_start);
+
+    // 解析 POS
+    long value = 0;
+    char *q    = pos_start;
+    int   neg  = 0;
+    if (q < pos_end && *q == '-') {
+        neg = 1;
+        ++q;
+    }
+    if (q == pos_end) {
+        info->valid = 0;
+        return;
+    }
+    while (q < pos_end && *q >= '0' && *q <= '9') {
+        value = value * 10 + (*q - '0');
+        ++q;
+    }
+    if (q != pos_end) {
+        info->valid = 0;
+        return;
+    }
+    if (neg) value = -value;
+    info->pos   = value;
+    info->valid = 1;
+}
+
+// 比较 RNAME（字典序）
+static int cmp_rname(const LineInfo *a, const LineInfo *b)
+{
+    int len = (a->rname_len < b->rname_len) ? a->rname_len : b->rname_len;
+    int r = 0;
+    if (len > 0) r = memcmp(a->rname, b->rname, (unsigned long)len);
+    if (r != 0) return r;
+    if (a->rname_len < b->rname_len) return -1;
+    if (a->rname_len > b->rname_len) return 1;
+    return 0;
+}
+
+// 比较两个行：按 RNAME, 再按 POS
+static int cmp_line(const LineInfo *a, const LineInfo *b)
+{
+    if (!a->valid && !b->valid) {
+        if (a->start < b->start) return -1;
+        if (a->start > b->start) return 1;
+        return 0;
+    } else if (!a->valid) {
+        return -1;
+    } else if (!b->valid) {
+        return 1;
+    }
+
+    int cr = cmp_rname(a, b);
+    if (cr < 0) return -1;
+    if (cr > 0) return 1;
+    if (a->pos < b->pos) return -1;
+    if (a->pos > b->pos) return 1;
+
+    // 完全相同，按原始顺序（start 小的在前）
+    if (a->start < b->start) return -1;
+    if (a->start > b->start) return 1;
+    return 0;
+}
+
+// 快速排序（原地）
+// arr: LineInfo 数组
+// left, right: [left, right]
+static void quicksort_lineinfo(LineInfo *arr, int left, int right)
+{
+    int i = left;
+    int j = right;
+    LineInfo pivot = arr[(left + right) / 2];
+
+    while (i <= j) {
+        while (cmp_line(&arr[i], &pivot) < 0) ++i;
+        while (cmp_line(&arr[j], &pivot) > 0) --j;
+        if (i <= j) {
+            LineInfo tmp = arr[i];
+            arr[i] = arr[j];
+            arr[j] = tmp;
+            ++i;
+            --j;
+        }
+    }
+    if (left < j)  quicksort_lineinfo(arr, left, j);
+    if (i < right) quicksort_lineinfo(arr, i, right);
+}
+
+// 解析一个 buffer 里的所有 SAM 行
+static int parse_sam_lines(char *buf, unsigned long size, LineInfo **lines_out)
+{
+    *lines_out = 0;
+    if (size == 0) return 0;
+
+    // 1) 统计行数
+    int  n_lines = 0;
+    int  last_is_nl = 0;
+    unsigned long i;
+    for (i = 0; i < size; ++i) {
+        if (buf[i] == '\n') {
+            n_lines++;
+            last_is_nl = 1;
+        } else {
+            last_is_nl = 0;
+        }
+    }
+    if (!last_is_nl) n_lines++;  // 最后一行可能没有 '\n'
+
+    if (n_lines <= 0) return 0;
+
+    //LineInfo *lines = (LineInfo*)ldm_malloc(sizeof(LineInfo) * (unsigned long)n_lines);
+    LineInfo *lines = (LineInfo*)malloc(sizeof(LineInfo) * (unsigned long)n_lines);
+    if (!lines) {
+        return 0;
+    }
+
+    // 2) 填写每行信息并解析 RNAME+POS
+    int idx = 0;
+    i = 0;
+    while (i < size && idx < n_lines) {
+        unsigned long start = i;
+        while (i < size && buf[i] != '\n') ++i;
+        unsigned long line_end = i;              // 不含 '\n'
+        int has_nl = (i < size && buf[i] == '\n');
+        if (has_nl) ++i;
+
+        unsigned long len = has_nl ? (i - start) : (line_end - start);
+
+        lines[idx].start = start;
+        lines[idx].len   = len;
+        lines[idx].rname = 0;
+        lines[idx].rname_len = 0;
+        lines[idx].pos   = -1;
+        lines[idx].valid = 0;
+
+        unsigned long text_len = line_end - start; // 不含 '\n'
+        if (text_len > 0) {
+            parse_rname_pos(buf + start, text_len, &lines[idx]);
+        }
+        idx++;
+    }
+
+    *lines_out = lines;
+    return idx;
+}
+
+// 从核入口：每个 CPE 负责 paras[_PEN] 这一份
+extern "C" void slave_sam_sort_cpe(SamSortPara paras[64])
+{
+    int id = _PEN;
+    SamSortPara *para = &paras[id];
+
+    char         *in_buf  = para->in_buf;
+    char         *out_buf = para->out_buf;
+    unsigned long size    = para->size;
+
+    if (!in_buf || !out_buf || size == 0) {
+        return;
+    }
+
+    LineInfo *lines = 0;
+    int n_lines = parse_sam_lines(in_buf, size, &lines);
+
+    if (n_lines > 1 && lines) {
+        quicksort_lineinfo(lines, 0, n_lines - 1);
+    }
+
+    // 按排序结果写入 out_buf
+    unsigned long out_pos = 0;
+    int i;
+    for (i = 0; i < n_lines; ++i) {
+        if (lines[i].len == 0) continue;
+        // 简单边界保护：不应该超过原 size（正常情况 len 总和 == size）
+        if (out_pos + lines[i].len > size) break;
+        memcpy(out_buf + out_pos,
+                         in_buf  + lines[i].start,
+                         (unsigned long)lines[i].len);
+        out_pos += lines[i].len;
+    }
+
+    *(para->out_size) = out_pos;
+    //if (lines) ldm_free(lines, sizeof(LineInfo) * (unsigned long)n_lines);
+    if (lines) free(lines);
+}
+
+#endif // __sw_slave__
+
+// ============================= 主核代码 =============================
+#ifdef __sw_host__
+
+extern "C" {
+#include <athread.h>
+}
+#include <pthread.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <errno.h>
+
+extern "C" void slave_sam_sort_cpe(SamSortPara paras[64]);
+
+static double now_ms()
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
+}
+
+#define BATCH_SIZE      64
+#define MAX_PATH_LEN    512
+#define MAX_BASENAME    128
+#define MAX_BUF_SIZE    (100UL * 1024UL * 1024UL)   // 100MB
+
+// 处理一个批次（<=64 个文件）：
+//  - 已经把每个文件读入 in_bufs[i]，大小 sizes[i]
+//  - 对应的输出路径为 out_paths[i]
+//  - 准备好 paras[i].in_buf/out_buf/size，其他位置填 0。
+//  - 调用从核排序，然后把 out_bufs 写回文件。
+static void process_batch(int batch_count,
+                          char in_paths[][MAX_PATH_LEN],
+                          char out_paths[][MAX_PATH_LEN],
+                          char *in_bufs[],
+                          char *out_bufs[],
+                          unsigned long sizes[],
+                          double *sort_ms_acc,
+                          double *write_ms_acc)
+{
+
+    //for (int i = 0; i < batch_count; i++) {
+    //    printf("%d\n", sizes[i]);
+    //}
+    if (batch_count <= 0) return;
+
+    SamSortPara paras[64];
+    unsigned long out_sizes[64];
+    int i;
+
+    for (i = 0; i < 64; ++i) {
+        paras[i].in_buf  = 0;
+        paras[i].out_buf = 0;
+        paras[i].size    = 0;
+        paras[i].out_size = &(out_sizes[i]);
+    }
+
+    for (i = 0; i < batch_count; ++i) {
+        paras[i].in_buf  = in_bufs[i];
+        paras[i].out_buf = out_bufs[i];
+        paras[i].size    = sizes[i];
+    }
+
+    double t0 = now_ms();
+
+    // 并行排序
+    __real_athread_spawn((void*)slave_sam_sort_cpe, paras, 1);
+    athread_join();
+
+    double t1 = now_ms();
+    *sort_ms_acc += (t1 - t0);
+
+    // 写回文件
+    t0 = now_ms();
+    for (i = 0; i < batch_count; ++i) {
+        unsigned long out_size = *(paras[i].out_size); // CPE 写回的实际输出长度
+        //printf("out %s %d\n", out_paths[i], out_size);
+        FILE *fout = fopen(out_paths[i], "wb");
+        if (!fout) {
+            fprintf(stderr, "fopen output failed: %s (%s)\n",
+                    out_paths[i], strerror(errno));
+            continue;
+        }
+        if (out_size > 0) {
+            size_t nwrite = fwrite(out_bufs[i], 1, (size_t)out_size, fout);
+            if (nwrite != out_size) {
+                fprintf(stderr,
+                        "fwrite incomplete for %s: expect=%lu got=%zu\n",
+                        out_paths[i], out_size, nwrite);
+            }
+        }
+        fclose(fout);
+    }
+    t1 = now_ms();
+    *write_ms_acc += (t1 - t0);
+}
+
+// 主核 main：
+//   argv[1] = 输入目录，例如 /home/.../out
+//   argv[2] = 输出目录，例如 /home/.../out_sort
+// 输出文件名 = 输入文件名 + ".sorted.sw.sam"
+int main(int argc, char **argv)
+{
+    if (argc < 3) {
+        fprintf(stderr,
+                "Usage: %s <input_dir> <output_dir>\n"
+                "Example:\n"
+                "  %s /path/to/out /path/to/out_sort\n",
+                argv[0], argv[0]);
+        return 1;
+    }
+
+    const char *in_dir  = argv[1];
+    const char *out_dir = argv[2];
+
+    DIR *dir = opendir(in_dir);
+    if (!dir) {
+        fprintf(stderr, "opendir failed: %s (%s)\n",
+                in_dir, strerror(errno));
+        return 1;
+    }
+
+    athread_init();
+
+    double read_ms  = 0.0;
+    double sort_ms  = 0.0;
+    double write_ms = 0.0;
+    double total_start = now_ms();
+
+    int total_files = 0;
+
+    char batch_basenames[BATCH_SIZE][MAX_BASENAME];
+    char batch_inpaths[BATCH_SIZE][MAX_PATH_LEN];
+    char batch_outpaths[BATCH_SIZE][MAX_PATH_LEN];
+
+    char *in_bufs[BATCH_SIZE];
+    char *out_bufs[BATCH_SIZE];
+    unsigned long sizes[BATCH_SIZE];
+    for (int i = 0; i < BATCH_SIZE; i++) sizes[i] = 0;
+
+    int batch_count = 0;
+
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL) {
+        if (ent->d_name[0] == '.') continue;  // skip . and ..
+
+        // 路径/文件名
+        snprintf(batch_basenames[batch_count], MAX_BASENAME,
+                 "%s", ent->d_name);
+        snprintf(batch_inpaths[batch_count], MAX_PATH_LEN,
+                 "%s/%s", in_dir, ent->d_name);
+        snprintf(batch_outpaths[batch_count], MAX_PATH_LEN,
+                 "%s/%s.sorted.sw.sam", out_dir, ent->d_name);
+
+        // 读文件到 in_buf
+        struct stat st;
+        if (stat(batch_inpaths[batch_count], &st) != 0) {
+            fprintf(stderr, "stat failed: %s (%s)\n",
+                    batch_inpaths[batch_count], strerror(errno));
+            continue;
+        }
+
+        unsigned long fsize = (unsigned long)st.st_size;
+        if (fsize > MAX_BUF_SIZE) {
+            fprintf(stderr,
+                    "File too large (> %lu MB): %s, size=%lu\n",
+                    (unsigned long)(MAX_BUF_SIZE / 1024 / 1024),
+                    batch_inpaths[batch_count], fsize);
+            continue;
+        }
+        //printf("file %s size %d\n", batch_inpaths[batch_count], fsize);
+
+        double t0 = now_ms();
+
+        FILE *fin = fopen(batch_inpaths[batch_count], "rb");
+        if (!fin) {
+            fprintf(stderr, "fopen input failed: %s (%s)\n",
+                    batch_inpaths[batch_count], strerror(errno));
+            continue;
+        }
+
+        char *ibuf = 0;
+        char *obuf = 0;
+        if (fsize > 0) {
+            ibuf = (char*)malloc((size_t)fsize);
+            obuf = (char*)malloc((size_t)fsize);
+            if (!ibuf || !obuf) {
+                fprintf(stderr, "malloc buf failed for %s size=%lu\n",
+                        batch_inpaths[batch_count], fsize);
+                if (ibuf) free(ibuf);
+                if (obuf) free(obuf);
+                fclose(fin);
+                continue;
+            }
+            size_t nread = fread(ibuf, 1, (size_t)fsize, fin);
+            if (nread != fsize) {
+                fprintf(stderr,
+                        "fread incomplete for %s: expect=%lu got=%zu\n",
+                        batch_inpaths[batch_count], fsize, nread);
+                free(ibuf);
+                free(obuf);
+                fclose(fin);
+                continue;
+            }
+        }
+        fclose(fin);
+
+        double t1 = now_ms();
+        read_ms += (t1 - t0);
+
+        in_bufs[batch_count]  = ibuf;
+        out_bufs[batch_count] = obuf;
+        sizes[batch_count]    = fsize;
+
+        batch_count++;
+        total_files++;
+
+        // 凑满 64 个就发一次从核
+        if (batch_count == BATCH_SIZE) {
+            process_batch(batch_count,
+                          batch_inpaths, batch_outpaths,
+                          in_bufs, out_bufs, sizes,
+                          &sort_ms, &write_ms);
+
+            // 批处理后释放缓冲
+            int i;
+            for (i = 0; i < batch_count; ++i) {
+                if (in_bufs[i])  free(in_bufs[i]);
+                if (out_bufs[i]) free(out_bufs[i]);
+                sizes[i] = 0;
+            }
+            batch_count = 0;
+        }
+    }
+
+    // 处理最后一批 (<64)
+    if (batch_count > 0) {
+        process_batch(batch_count,
+                      batch_inpaths, batch_outpaths,
+                      in_bufs, out_bufs, sizes,
+                      &sort_ms, &write_ms);
+        int i;
+        for (i = 0; i < batch_count; ++i) {
+            if (in_bufs[i])  free(in_bufs[i]);
+            if (out_bufs[i]) free(out_bufs[i]);
+            sizes[i] = 0;
+        }
+    }
+
+    closedir(dir);
+
+    double total_end = now_ms();
+    double total_ms  = total_end - total_start;
+
+    fprintf(stderr,
+            "\n==== Summary ====\n"
+            "Files processed : %d\n"
+            "Read time       : %.3f ms\n"
+            "Sort(CPE) time  : %.3f ms\n"
+            "Write time      : %.3f ms\n"
+            "Total time      : %.3f ms\n",
+            total_files, read_ms, sort_ms, write_ms, total_ms);
+
+    return 0;
+}
+
+#endif // __sw_host__
+
