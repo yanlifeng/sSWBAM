@@ -1,6 +1,6 @@
 PRINTDEBUG := 0
 
-TARGET := sw_sam_sort
+TARGET := sw_sam_process
 BIN_TARGET := $(TARGET)
 
 DIR_SRC := ./src
